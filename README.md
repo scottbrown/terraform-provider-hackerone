@@ -1,64 +1,111 @@
-# Terraform Provider Scaffolding (Terraform Plugin Framework)
+# terraform-provider-hackerone
 
-_This template repository is built on the [Terraform Plugin Framework](https://github.com/hashicorp/terraform-plugin-framework). The template repository built on the [Terraform Plugin SDK](https://github.com/hashicorp/terraform-plugin-sdk) can be found at [terraform-provider-scaffolding](https://github.com/hashicorp/terraform-provider-scaffolding). See [Which SDK Should I Use?](https://developer.hashicorp.com/terraform/plugin/framework-benefits) in the Terraform documentation for additional information._
+A Terraform provider for managing [HackerOne](https://www.hackerone.com/) bug
+bounty **program configuration as code**, built on the
+[HackerOne v1 REST API](https://api.hackerone.com/customer-resources/).
 
-This repository is a *template* for a [Terraform](https://www.terraform.io) provider. It is intended as a starting point for creating Terraform providers, containing:
+The goal: stop clickops-ing program policy, scope, and triage automation in the
+H1 console and put it under version control + review instead.
 
-- A resource and a data source (`internal/provider/`),
-- Examples (`examples/`) and generated documentation (`docs/`),
-- Miscellaneous meta files.
+> **Status:** proof of concept, partially validated against a live HackerOne
+> account via `terraform import` (clean "N to import, 0 to change" plans).
+>
+> | Resource / data source | Live status |
+> |---|---|
+> | `hackerone_asset` | ✅ import-verified (0 drift) |
+> | `hackerone_asset_scope` | ✅ import-verified (0 drift) |
+> | `hackerone_policy` | ✅ import-verified (0 drift) |
+> | `data.hackerone_program` | ✅ read-verified |
+> | `hackerone_scope_exclusion` | ✅ import-verified (0 drift) |
+> | `hackerone_automation` | ⚠️ untestable on non-Enterprise orgs — the Automations API is an **Enterprise-tier-only** feature and returns `404` otherwise (see below) |
 
-These files contain boilerplate code that you will need to edit to create your own Terraform provider. Tutorials for creating Terraform providers can be found on the [HashiCorp Developer](https://developer.hashicorp.com/terraform/tutorials/providers-plugin-framework) platform. _Terraform Plugin Framework specific guides are titled accordingly._
+## What it manages
 
-Please see the [GitHub template repository documentation](https://help.github.com/en/github/creating-cloning-and-archiving-repositories/creating-a-repository-from-a-template) for how to create a new repository from this template on GitHub.
+| Resource / data source | H1 API | Notes |
+|---|---|---|
+| `hackerone_policy` | `PUT /programs/{id}/policy` | Program policy prose (Markdown). Singleton per program. |
+| `hackerone_scope_exclusion` | `/programs/{id}/scope_exclusions` | Out-of-scope entries. Full CRUD. |
+| `hackerone_asset` | `/organizations/{org_id}/assets` | Org asset inventory. Destroy = **archive** (no hard delete in the API). |
+| `hackerone_asset_scope` | `POST /organizations/{org_id}/assets/{asset_id}/scopes` | Binds an asset into a program's scope ("in scope"). Read via the program's `structured_scopes`; destroy = archive from scope. |
+| `hackerone_automation` | `/organizations/{org_id}/automations` | Triage automations. Update uses `PATCH`; destroy = **disable** (no delete endpoint). |
+| `data.hackerone_program` | `GET /programs/{id}` | Resolves a program handle → numeric program ID **and** organization ID. Reference these instead of hardcoding IDs. |
+| `data.hackerone_asset` | `GET /organizations/{org_id}/assets` | Looks up an existing (possibly unmanaged) asset by `identifier`, exposing its bare `asset_id` for `hackerone_asset_scope`. |
+| `data.hackerone_scope_exclusions` | `GET /programs/{id}/scope_exclusions` | Lists all scope exclusions for a program (fully paginated). |
+| `data.hackerone_weaknesses` | `GET /programs/{id}/weaknesses` | Lists the program's weakness/CWE catalog (fully paginated — commonly 1000+ entries). |
 
-Once you've written your provider, you'll want to [publish it on the Terraform Registry](https://developer.hashicorp.com/terraform/registry/providers/publishing) so that others can use it.
+## Authentication
 
-## Requirements
+HTTP Basic auth with an API **username + token** (the H1 "API Token" settings
+page). Prefer environment variables so the token stays out of Terraform state:
 
-- [Terraform](https://developer.hashicorp.com/terraform/downloads) >= 1.0
-- [Go](https://golang.org/doc/install) >= 1.24
-
-## Building the Provider
-
-1. Clone the repository
-1. Enter the repository directory
-1. Build the provider using the Go `install` command:
-
-```shell
-go install
+```bash
+export HACKERONE_API_USERNAME="your-api-identity"
+export HACKERONE_API_TOKEN="your-api-token"
 ```
 
-## Adding Dependencies
+Most write operations require the **"Team Management"** permission on the API
+identity; without it the API returns `403`.
 
-This provider uses [Go modules](https://github.com/golang/go/wiki/Modules).
-Please see the Go documentation for the most up to date information about using Go modules.
+> **Recommendation:** create a dedicated service/API identity for CI rather than
+> using a personal token. HackerOne personal tokens are per-user and
+> **regenerating one revokes the prior token**, which will silently break
+> automation, and every change is attributed to that human.
 
-To add a new dependency `github.com/author/dependency` to your Terraform provider:
+## Design notes & sharp edges
 
-```shell
-go get github.com/author/dependency
-go mod tidy
+These reflect real constraints of the H1 public REST API, not choices:
+
+- **Program scope vs. org scope are different API roots.** Policy and scope
+  exclusions live under `/programs/{id}/...`; assets and automations live under
+  `/organizations/{org_id}/...`. You need both a program ID and an org ID.
+- **"In scope" is managed via the Assets API, not a program endpoint.**
+  `GET /programs/{id}/structured_scopes` is read-only. Adding an asset to a
+  program's scope is `POST /organizations/{org_id}/assets/{asset_id}/scopes`
+  with a `programs` relationship — this is what `hackerone_asset_scope` wraps.
+  Its Read side filters the program's `structured_scopes` list by scope ID
+  since there is no single-item GET, and create vs. update disagree on the
+  `notify_subscribers_on/of_changes` field spelling (the client sends both).
+- **No hard deletes for assets or automations.** Destroy archives the asset and
+  disables the automation, respectively, and emits a warning where relevant.
+- **`hackerone_policy` delete is a no-op** — there is no API to clear a policy.
+- **Rate limits / pagination are undocumented** in the public reference; the
+  client implements bounded exponential backoff honoring `Retry-After`.
+- **Bounty tables are read-only** in the public API and cannot be managed here.
+- **Automations are Enterprise-tier only.** On non-Enterprise organizations the
+  entire `/organizations/{org_id}/automations` tree returns `404` (not `403`),
+  so `hackerone_automation` is unusable there. Confirmed by triangulation:
+  every other org endpoint (`assets`, `asset_tags`, `members`) returns `200` for
+  the same identity while `automations` 404s.
+- **`GET /programs/{id}` requires the numeric ID, not the handle** (a handle
+  returns `400`). `data.hackerone_program` resolves handles by listing
+  `/me/programs` and matching, rather than hitting the program path directly.
+
+## Building
+
+```bash
+go build ./...
+go vet ./...
+go install        # builds the provider into $GOBIN
 ```
 
-Then commit the changes to `go.mod` and `go.sum`.
+For local testing, add a `~/.terraformrc` dev override pointing
+`registry.terraform.io/scottbrown/hackerone` at your `$GOBIN`:
 
-## Using the Provider
-
-Fill this in for each provider
-
-## Developing the Provider
-
-If you wish to work on the provider, you'll first need [Go](http://www.golang.org) installed on your machine (see [Requirements](#requirements) above).
-
-To compile the provider, run `go install`. This will build the provider and put the provider binary in the `$GOPATH/bin` directory.
-
-To generate or update documentation, run `make generate`.
-
-In order to run the full suite of Acceptance tests, run `make testacc`.
-
-*Note:* Acceptance tests create real resources, and often cost money to run.
-
-```shell
-make testacc
+```hcl
+provider_installation {
+  dev_overrides {
+    "scottbrown/hackerone" = "/path/to/your/GOBIN"
+  }
+  direct {}
+}
 ```
+
+Documentation is generated with `tfplugindocs` (`make generate`), and releases
+are cut with GoReleaser via the GitHub Actions workflow (this repo is based on
+the HashiCorp terraform-provider scaffolding template).
+
+## Roadmap
+
+- [ ] Acceptance tests against a sandbox program (`TF_ACC`)
+- [ ] Asset tags / tag categories
+- [ ] Publish tagged release to the Terraform Registry

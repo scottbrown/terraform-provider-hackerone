@@ -1,109 +1,135 @@
-// Copyright IBM Corp. 2021, 2025
 // SPDX-License-Identifier: MPL-2.0
 
 package provider
 
 import (
 	"context"
-	"net/http"
+	"os"
 
-	"github.com/hashicorp/terraform-plugin-framework/action"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
-	"github.com/hashicorp/terraform-plugin-framework/ephemeral"
-	"github.com/hashicorp/terraform-plugin-framework/function"
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+
+	"github.com/scottbrown/terraform-provider-hackerone/internal/client"
 )
 
-// Ensure ScaffoldingProvider satisfies various provider interfaces.
-var _ provider.Provider = &ScaffoldingProvider{}
-var _ provider.ProviderWithFunctions = &ScaffoldingProvider{}
-var _ provider.ProviderWithEphemeralResources = &ScaffoldingProvider{}
-var _ provider.ProviderWithActions = &ScaffoldingProvider{}
+// Ensure the implementation satisfies the provider interface.
+var _ provider.Provider = &hackeroneProvider{}
 
-// ScaffoldingProvider defines the provider implementation.
-type ScaffoldingProvider struct {
-	// version is set to the provider version on release, "dev" when the
-	// provider is built and ran locally, and "test" when running acceptance
-	// testing.
+type hackeroneProvider struct {
 	version string
 }
 
-// ScaffoldingProviderModel describes the provider data model.
-type ScaffoldingProviderModel struct {
-	Endpoint types.String `tfsdk:"endpoint"`
+// New returns a provider.Provider factory for the given build version.
+func New(version string) func() provider.Provider {
+	return func() provider.Provider {
+		return &hackeroneProvider{version: version}
+	}
 }
 
-func (p *ScaffoldingProvider) Metadata(ctx context.Context, req provider.MetadataRequest, resp *provider.MetadataResponse) {
-	resp.TypeName = "scaffolding"
+type providerModel struct {
+	APIUsername types.String `tfsdk:"api_username"`
+	APIToken    types.String `tfsdk:"api_token"`
+	BaseURL     types.String `tfsdk:"base_url"`
+}
+
+func (p *hackeroneProvider) Metadata(_ context.Context, _ provider.MetadataRequest, resp *provider.MetadataResponse) {
+	resp.TypeName = "hackerone"
 	resp.Version = p.version
 }
 
-func (p *ScaffoldingProvider) Schema(ctx context.Context, req provider.SchemaRequest, resp *provider.SchemaResponse) {
+func (p *hackeroneProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
 	resp.Schema = schema.Schema{
+		MarkdownDescription: "Manage HackerOne program configuration as code via the HackerOne v1 REST API.",
 		Attributes: map[string]schema.Attribute{
-			"endpoint": schema.StringAttribute{
-				MarkdownDescription: "Example provider attribute",
+			"api_username": schema.StringAttribute{
 				Optional:            true,
+				MarkdownDescription: "HackerOne API identifier. Falls back to the `HACKERONE_API_IDENTIFIER` (or `HACKERONE_API_USERNAME`) environment variable.",
+			},
+			"api_token": schema.StringAttribute{
+				Optional:            true,
+				Sensitive:           true,
+				MarkdownDescription: "HackerOne API token. Falls back to the `HACKERONE_API_TOKEN` environment variable. Prefer the env var so the secret stays out of state.",
+			},
+			"base_url": schema.StringAttribute{
+				Optional:            true,
+				MarkdownDescription: "Override the API base URL. Defaults to `https://api.hackerone.com/v1`.",
 			},
 		},
 	}
 }
 
-func (p *ScaffoldingProvider) Configure(ctx context.Context, req provider.ConfigureRequest, resp *provider.ConfigureResponse) {
-	var data ScaffoldingProviderModel
-
-	resp.Diagnostics.Append(req.Config.Get(ctx, &data)...)
-
+func (p *hackeroneProvider) Configure(ctx context.Context, req provider.ConfigureRequest, resp *provider.ConfigureResponse) {
+	var cfg providerModel
+	resp.Diagnostics.Append(req.Config.Get(ctx, &cfg)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	// Configuration values are now available.
-	// if data.Endpoint.IsNull() { /* ... */ }
+	// HACKERONE_API_IDENTIFIER matches HackerOne's own term for the value on the
+	// API token settings page; HACKERONE_API_USERNAME is kept as a fallback.
+	username := firstNonEmpty(
+		cfg.APIUsername.ValueString(),
+		os.Getenv("HACKERONE_API_IDENTIFIER"),
+		os.Getenv("HACKERONE_API_USERNAME"),
+	)
+	token := firstNonEmpty(cfg.APIToken.ValueString(), os.Getenv("HACKERONE_API_TOKEN"))
 
-	// Example client configuration for data sources and resources
-	client := http.DefaultClient
-	resp.DataSourceData = client
-	resp.ResourceData = client
+	if username == "" {
+		resp.Diagnostics.AddAttributeError(
+			path.Root("api_username"),
+			"Missing HackerOne API username",
+			"Set the api_username argument or the HACKERONE_API_USERNAME environment variable.",
+		)
+	}
+	if token == "" {
+		resp.Diagnostics.AddAttributeError(
+			path.Root("api_token"),
+			"Missing HackerOne API token",
+			"Set the api_token argument or the HACKERONE_API_TOKEN environment variable.",
+		)
+	}
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	opts := []client.Option{client.WithUserAgent("terraform-provider-hackerone/" + p.version)}
+	if base := cfg.BaseURL.ValueString(); base != "" {
+		opts = append(opts, client.WithBaseURL(base))
+	}
+
+	c := client.New(username, token, opts...)
+	resp.DataSourceData = c
+	resp.ResourceData = c
 }
 
-func (p *ScaffoldingProvider) Resources(ctx context.Context) []func() resource.Resource {
+func (p *hackeroneProvider) Resources(_ context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
-		NewExampleResource,
+		NewPolicyResource,
+		NewScopeExclusionResource,
+		NewAssetResource,
+		NewAssetScopeResource,
+		NewAutomationResource,
 	}
 }
 
-func (p *ScaffoldingProvider) EphemeralResources(ctx context.Context) []func() ephemeral.EphemeralResource {
-	return []func() ephemeral.EphemeralResource{
-		NewExampleEphemeralResource,
-	}
-}
-
-func (p *ScaffoldingProvider) DataSources(ctx context.Context) []func() datasource.DataSource {
+func (p *hackeroneProvider) DataSources(_ context.Context) []func() datasource.DataSource {
 	return []func() datasource.DataSource{
-		NewExampleDataSource,
+		NewProgramDataSource,
+		NewAssetDataSource,
+		NewScopeExclusionsDataSource,
+		NewWeaknessesDataSource,
 	}
 }
 
-func (p *ScaffoldingProvider) Functions(ctx context.Context) []func() function.Function {
-	return []func() function.Function{
-		NewExampleFunction,
-	}
-}
-
-func (p *ScaffoldingProvider) Actions(ctx context.Context) []func() action.Action {
-	return []func() action.Action{
-		NewExampleAction,
-	}
-}
-
-func New(version string) func() provider.Provider {
-	return func() provider.Provider {
-		return &ScaffoldingProvider{
-			version: version,
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
 		}
 	}
+	return ""
 }
