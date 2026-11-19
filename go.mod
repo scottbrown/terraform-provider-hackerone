@@ -1,6 +1,6 @@
 module github.com/scottbrown/terraform-provider-hackerone
 
-go 1.25.8
+go 1.27.4
 
 require (
 	github.com/hashicorp/terraform-plugin-framework v1.19.0
